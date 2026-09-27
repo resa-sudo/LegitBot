@@ -1,7 +1,7 @@
 """Статусы материалов; ни один статус не является оценкой подлинности."""
 from collections import Counter
 from enum import StrEnum
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from .photo_requirements import PhotoRequirement
 
@@ -20,6 +20,7 @@ class PhotoRecord(TypedDict):
     file_id: str | None
     status: str
     reason: str | None
+    validation: NotRequired[dict[str, str | bool | float | None]]
 
 
 def make_record(requirement: PhotoRequirement, number: int, *,

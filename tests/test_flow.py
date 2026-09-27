@@ -1,6 +1,8 @@
 """Проверки FSM без токена и запросов к Telegram: python -m unittest discover -s tests -v."""
 
 import asyncio
+import os
+import json
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
@@ -20,11 +22,32 @@ from legitbot.flow import (
 )
 
 
+TEST_IMAGE = b"\xff\xd8\xffoffline-test-image"
+GOOD_ASSESSMENT = {
+    "matches_requested_zone": True, "detected_zone": "top_view", "quality_ok": True,
+    "reason": None, "user_message": "Photo accepted.", "confidence": 0.95,
+}
+
+
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        mode_patch = patch.dict(os.environ, {"PHOTO_VALIDATION_PROVIDER": "openai"})
+        mode_patch.start()
+        self.addCleanup(mode_patch.stop)
         self.bot = Bot(token="123456:offline_test_placeholder")
         self.dp = create_dispatcher()
         self.sequence = 0
+        provider_patch = patch("legitbot.photo_validation.request_assessment", new_callable=AsyncMock)
+        self.provider = provider_patch.start()
+        self.provider.return_value = json.dumps(GOOD_ASSESSMENT)
+        self.addCleanup(provider_patch.stop)
+        async def download(photo, *, destination, timeout):
+            destination.write(TEST_IMAGE)
+            return destination
+        download_patch = patch.object(Bot, "download", new_callable=AsyncMock)
+        self.download = download_patch.start()
+        self.download.side_effect = download
+        self.addCleanup(download_patch.stop)
         self.answer_patch = patch.object(Message, "answer", new_callable=AsyncMock)
         self.answer = self.answer_patch.start()
         self.addCleanup(self.answer_patch.stop)
@@ -458,7 +481,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         await self.prepare_af1()
         async def reject(requirement, photo):
             self.assertEqual(requirement.id, "TOP_VIEW")
-            self.assertTrue(photo.file_id)
+            self.assertEqual(photo, TEST_IMAGE)
             self.assertNotIn("TOP_VIEW", (await self.context().get_data())["photos"])
             return PhotoValidationResult(False, PhotoStatus.NEEDS_RESHOOT,
                                          "wrong_zone", "Переснимите вид сверху.")
@@ -499,6 +522,63 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_af1()
         self.assertIn("Получено: 13", self.answer.call_args.args[0])
         self.assertIn("Недоступно: 0", self.answer.call_args.args[0])
+
+    async def test_ai_heels_keyboard_rejection_then_acceptance(self):
+        await self.prepare_af1()
+        for _ in range(3):
+            await self.send(photo=True)
+        self.provider.return_value = json.dumps({
+            **GOOD_ASSESSMENT, "matches_requested_zone": False,
+            "detected_zone": "keyboard", "reason": "wrong_zone",
+        })
+        await self.send(photo=True)
+        data = await self.context().get_data()
+        self.assertEqual(data["photo_index"], 3)
+        self.assertEqual(data["photos"]["HEELS"]["status"], "needs_reshoot")
+        self.assertEqual(data["photos"]["HEELS"]["reason"], "wrong_zone")
+        self.assertIn("задника", self.answer.call_args_list[-2].args[0])
+        self.provider.return_value = json.dumps({**GOOD_ASSESSMENT, "detected_zone": "heels"})
+        await self.send(photo=True)
+        data = await self.context().get_data()
+        self.assertEqual(data["photo_index"], 4)
+        self.assertEqual(data["photos"]["HEELS"]["status"], "received")
+        self.assertEqual(data["photos"]["HEELS"]["validation"]["detected_zone"], "heels")
+
+    async def test_ai_poor_quality_stays_on_step(self):
+        await self.prepare_af1()
+        self.provider.return_value = json.dumps({
+            **GOOD_ASSESSMENT, "quality_ok": False, "reason": "poor_quality",
+        })
+        await self.send(photo=True)
+        data = await self.context().get_data()
+        self.assertEqual(data["photo_index"], 0)
+        self.assertEqual(data["photos"]["TOP_VIEW"]["status"], "needs_reshoot")
+        self.assertEqual(data["photos"]["TOP_VIEW"]["reason"], "poor_quality")
+
+    async def test_ai_failure_preserves_fsm_and_existing_reshoot(self):
+        await self.finish_af1()
+        await self.send(RETAKE)
+        await self.send("Вид сверху")
+        before = await self.context().get_data()
+        for failure in ("timeout", "malformed"):
+            self.provider.side_effect = TimeoutError("private-detail") if failure == "timeout" else None
+            self.provider.return_value = "{not-json}"
+            with self.assertLogs("legitbot.photo_validation", level="WARNING") as logs:
+                await self.send(photo=True)
+            self.assertNotIn("private-detail", str(logs.output))
+            self.assertEqual(await self.context().get_state(), AF1.photos.state)
+            self.assertEqual(await self.context().get_data(), before)
+            self.assertIn("Не удалось проверить", self.answer.call_args_list[-2].args[0])
+
+    async def test_telegram_download_failure_preserves_state(self):
+        await self.prepare_af1()
+        before = await self.context().get_data()
+        self.download.side_effect = TimeoutError("private-telegram-url")
+        with self.assertLogs("legitbot.af1_flow", level="WARNING") as logs:
+            await self.send(photo=True)
+        self.assertNotIn("private-telegram-url", str(logs.output))
+        self.assertEqual(await self.context().get_data(), before)
+        self.provider.assert_not_awaited()
 
 if __name__ == "__main__":
     unittest.main()

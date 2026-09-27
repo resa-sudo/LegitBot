@@ -18,7 +18,11 @@ MVP Telegram-бота для проверки подлинности товар�
   Без токена явно указывать, что соединение с Telegram не проверено.
 - Если нужен токен, аккаунт или действие пользователя, остановиться
   и назвать конкретный следующий шаг. Не просить присылать секреты в чат.
-- Не подключать OpenAI, Supabase и другие сервисы без следующего задания.
+- PHOTO_VALIDATION_PROVIDER=local по умолчанию; без ключа и без внешних API.
+- local проверяет только техническое качество Pillow, не ракурс; confidence/detected_zone=None.
+- Пороги только в QualityThresholds (local_photo_validation.py).
+- OpenAI сохранён и доступен только при явном provider=openai.
+- Не подключать Supabase, Roboflow, базу и проверку подлинности.
 - Не добавлять оплату, историю, сертификаты или экспертную проверку.
 - Принимать одиночные фото, отклонять файлы и альбомы. Коробка необязательна.
 - Бренды: Nike, Adidas, New Balance, Другой бренд. Jordan не отдельный бренд.
@@ -31,7 +35,13 @@ MVP Telegram-бота для проверки подлинности товар�
   INSOLES_BOTTOM и UNDER_INSOLE — unavailable/insole_not_removable. Не применять силу.
 - Хранить step_id, file_id, analysis_zone, step_number, status, reason.
 - Статусы: received, unavailable, missing, needs_reshoot. Обзор считает их отдельно.
-- Валидатор вызывается до received; пока принимает фото без анализа и внешних API.
+- Валидатор вызывается до received; local использует Pillow, openai — SDK и строгий JSON.
+- OPENAI_API_KEY и OPENAI_VISION_MODEL читать из .env; default gpt-4.1-mini.
+- При сбое API/скачивания сохранить FSM и прежние записи. Не принимать фото автоматически.
+- В OpenAI передавать только фото в памяти, зону и инструкции; не передавать Telegram-метаданные.
+- Логировать только тип технической ошибки, не текст исключения/ключ/ответ модели.
+- confidence — уверенность классификации зоны, не подлинности.
+- Тесты не обращаются к настоящим Telegram/OpenAI: подменять провайдера.
 - Требования AF1 не становятся обязательными для будущих моделей.
 - Конфигурация PhotoRequirement задаёт требования, без решений о подлинности.
 - Хранить отдельно brand, line, model; для остальных брендов line = None.
@@ -44,7 +54,8 @@ MVP Telegram-бота для проверки подлинности товар�
 - legitbot/af1_flow.py — FSM AF1, обзор и пересъёмка.
 - legitbot/photo_requirements.py — тип требования и конфигурация AF1.
 - legitbot/photo_records.py — статусы и счётчики.
-- legitbot/photo_validation.py — локальная заглушка проверки.
+- legitbot/photo_validation.py — проверка зоны через Responses API.
+- tests/test_photo_validation.py — тесты SDK и провайдера без сети.
 - tests/test_flow.py — тесты unittest без сети и реального токена.
 - requirements.txt — зависимости.
 - README.md — инструкция для Windows PowerShell.

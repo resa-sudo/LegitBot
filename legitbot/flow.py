@@ -48,7 +48,7 @@ async def start(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Привет! Я LegitBot 👟\n\n"
         "Помогу подготовить фотографии кроссовок для проверки. "
-        "AI-анализ пока не подключён.\n\nНажмите кнопку ниже.",
+        "Для Air Force 1 проверяю техническое качество фото. Подлинность пока не определяю.\n\nНажмите кнопку ниже.",
         reply_markup=keyboard(CHECK_BUTTON),
     )
 

@@ -1,4 +1,8 @@
 """Сбор и пересъёмка AF1: один обработчик для всех настроенных зон."""
+import asyncio
+import logging
+from io import BytesIO
+
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -54,9 +58,14 @@ async def select_model(message: Message, state: FSMContext) -> None:
     elif message.text == MODEL:
         await state.update_data(brand="Nike", line="Air Force 1", model=MODEL)
         await state.set_state(Check.confirmation)
+        validation_notice = (
+            "Фото передаются OpenAI для проверки ракурса и качества."
+            if photo_validation.get_provider() == "openai" else
+            "Фото проверяются локально только на техническое качество, без распознавания ракурса."
+        )
         await message.answer(
             f"Бренд: Nike\nЛинейка: Air Force 1\nМодель: {MODEL}\n\n"
-            "Сейчас мы только собираем фотографии. Решение о подлинности не принимается.",
+            f"{validation_notice} Решение о подлинности не принимается.",
             reply_markup=keyboard(BEGIN_BUTTON, BACK, cancel=True))
     else:
         if message.text == OTHER_MODEL:
@@ -150,14 +159,38 @@ async def save_photo(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     index = data["photo_index"]
     requirement = PHOTO_REQUIREMENTS[index]
-    # До ответа валидатора файл не получает статус received.
-    result = await photo_validation.validate_photo(requirement, message.photo[-1])
+    # Telegram-фото скачивается только в память, без URL с токеном в OpenAI.
+    try:
+        photo = message.photo[-1]
+        if photo.file_size and photo.file_size > photo_validation.MAX_IMAGE_BYTES:
+            raise ValueError("Image too large")
+        with BytesIO() as buffer:
+            async with asyncio.timeout(20):
+                await message.bot.download(photo, destination=buffer, timeout=15)
+            image = buffer.getvalue()
+        if not image or len(image) > photo_validation.MAX_IMAGE_BYTES:
+            raise ValueError("Invalid downloaded image size")
+        result = await photo_validation.validate_photo(requirement, image)
+        del image
+    except Exception as error:
+        logging.getLogger(__name__).warning("Photo download/validation failed (%s)", type(error).__name__)
+        result = photo_validation.unavailable_result()
     if result.accepted != (result.status == PhotoStatus.RECEIVED):
-        raise ValueError("Inconsistent photo validation result")
+        result = photo_validation.unavailable_result()
+    if result.retryable:
+        # Сетевой сбой не портит ранее принятый снимок при пересъёмке.
+        await message.answer(result.user_message)
+        await prompt(message, index)
+        return
     photos = dict(data.get("photos", {}))
     photos[requirement.id] = make_record(
         requirement, index + 1, file_id=message.photo[-1].file_id,
         status=result.status, reason=result.reason)
+    photos[requirement.id]["validation"] = {
+        "detected_zone": result.detected_zone,
+        "quality_ok": result.quality_ok,
+        "confidence": result.confidence,
+    }
     await state.update_data(photos=photos)
     if result.user_message:
         await message.answer(result.user_message)

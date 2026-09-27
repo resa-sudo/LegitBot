@@ -12,6 +12,7 @@ from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
 
 from .flow import create_router
+from .photo_validation import get_provider
 
 
 def create_dispatcher() -> Dispatcher:
@@ -40,6 +41,7 @@ async def main() -> None:
         ) from None
 
     dispatcher = create_dispatcher()
+    logging.getLogger(__name__).info("Photo validation provider: %s", get_provider())
     try:
         async with bot:
             # Проверяем токен перед ожиданием сообщений.
