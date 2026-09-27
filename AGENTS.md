@@ -26,8 +26,13 @@ MVP Telegram-бота для проверки подлинности товар�
 - Только Air Force 1 Low '07 White запускает специализированный сбор фото.
 - Другие линейки Nike и модели AF1 показывают заглушку.
 - Прежний сбор для остальных брендов сохранён для совместимости.
-- AF1: 13 зон, пропуск только BOX_LABEL. Хранить step_id, file_id,
-  analysis_zone, step_number, missing; пересъёмка заменяет одну запись.
+- AF1: 13 зон. BOX_LABEL необязательна: unavailable/no_box.
+- Несъёмные стельки: insole_not_removable=True; верх снять внутри обуви,
+  INSOLES_BOTTOM и UNDER_INSOLE — unavailable/insole_not_removable. Не применять силу.
+- Хранить step_id, file_id, analysis_zone, step_number, status, reason.
+- Статусы: received, unavailable, missing, needs_reshoot. Обзор считает их отдельно.
+- Валидатор вызывается до received; пока принимает фото без анализа и внешних API.
+- Требования AF1 не становятся обязательными для будущих моделей.
 - Конфигурация PhotoRequirement задаёт требования, без решений о подлинности.
 - Хранить отдельно brand, line, model; для остальных брендов line = None.
 - Отмена и /start очищают данные. Использовать изоляцию событий FSM.
@@ -37,7 +42,9 @@ MVP Telegram-бота для проверки подлинности товар�
 - legitbot/__main__.py — конфигурация и запуск polling.
 - legitbot/flow.py — общая навигация и прежний сценарий.
 - legitbot/af1_flow.py — FSM AF1, обзор и пересъёмка.
-- legitbot/photo_requirements.py — конфигурация зон.
+- legitbot/photo_requirements.py — тип требования и конфигурация AF1.
+- legitbot/photo_records.py — статусы и счётчики.
+- legitbot/photo_validation.py — локальная заглушка проверки.
 - tests/test_flow.py — тесты unittest без сети и реального токена.
 - requirements.txt — зависимости.
 - README.md — инструкция для Windows PowerShell.

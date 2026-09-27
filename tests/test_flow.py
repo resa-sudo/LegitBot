@@ -9,7 +9,10 @@ from aiogram import Bot
 from aiogram.types import Chat, Message, PhotoSize, Update, User
 
 from legitbot.af1_flow import AF1, BACK, NO_BOX, ANALYZE, RETAKE, OTHER_MODEL, UNSUPPORTED, PLACEHOLDER
-from legitbot.photo_requirements import MODEL, PHOTO_REQUIREMENTS
+from legitbot.photo_requirements import MODEL, AF1_PHOTO_REQUIREMENTS as PHOTO_REQUIREMENTS
+from legitbot.af1_flow import FIXED_INSOLES, review, zone_label
+from legitbot.photo_records import PhotoStatus, make_record
+from legitbot.photo_validation import PhotoValidationResult
 from legitbot.__main__ import create_dispatcher
 from legitbot.flow import (
     ANALYZE_BUTTON, BEGIN_BUTTON, BRANDS, CANCEL_BUTTON, CHECK_BUTTON,
@@ -200,9 +203,10 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["step_number"], index + 1)
             self.assertEqual(record["analysis_zone"], requirement.analysis_zone)
             self.assertTrue(record["file_id"])
-            self.assertFalse(record["missing"])
+            self.assertEqual(record["status"], "received")
+            self.assertIsNone(record["reason"])
         self.assertEqual(await self.context().get_state(), AF1.review.state)
-        self.assertIn("13/13", self.answer.call_args.args[0])
+        self.assertIn("Получено: 13", self.answer.call_args.args[0])
         data = await self.context().get_data()
         self.assertEqual((data["brand"], data["line"], data["model"]), ("Nike", "Air Force 1", MODEL))
         await self.send(ANALYZE)
@@ -237,16 +241,17 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_af1(missing=True)
         data = await self.context().get_data()
         self.assertEqual(len(data["photos"]), 13)
-        self.assertTrue(data["photos"]["BOX_LABEL"]["missing"])
+        self.assertEqual(data["photos"]["BOX_LABEL"]["status"], "unavailable")
+        self.assertEqual(data["photos"]["BOX_LABEL"]["reason"], "no_box")
         self.assertIsNone(data["photos"]["BOX_LABEL"]["file_id"])
-        self.assertIn("12/13", self.answer.call_args.args[0])
-        self.assertIn("Наклейка коробки — отсутствует", self.answer.call_args.args[0])
+        self.assertIn("Получено: 12", self.answer.call_args.args[0])
+        self.assertIn("Наклейка коробки — недоступно (нет коробки)", self.answer.call_args.args[0])
         for requirement in PHOTO_REQUIREMENTS:
             before = (await self.context().get_data())["photos"]
             await self.send(RETAKE)
             buttons = [row[0].text for row in self.answer.call_args.kwargs["reply_markup"].keyboard]
             self.assertEqual(len(buttons), 15)
-            label = requirement.title + (" — отсутствует" if before[requirement.id]["missing"] else "")
+            label = zone_label(requirement, before)
             self.assertIn(label, buttons)
             await self.send(label)
             await self.send(photo=True)
@@ -256,7 +261,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 if other.id != requirement.id:
                     self.assertEqual(before[other.id], after[other.id])
             self.assertNotEqual(before[requirement.id]["file_id"], after[requirement.id]["file_id"])
-        self.assertIn("13/13", self.answer.call_args.args[0])
+        self.assertIn("Получено: 13", self.answer.call_args.args[0])
 
     async def test_af1_retake_back_and_mark_box_missing(self):
         await self.finish_af1()
@@ -271,7 +276,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         await self.send(RETAKE)
         await self.send("Наклейка коробки")
         await self.send(NO_BOX)
-        self.assertIn("12/13", self.answer.call_args.args[0])
+        self.assertIn("Получено: 12", self.answer.call_args.args[0])
         await self.send(ANALYZE)
         self.assertEqual(self.answer.call_args.args[0], PLACEHOLDER)
 
@@ -330,6 +335,170 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             await self.send(CANCEL_BUTTON)
             self.assertIsNone(await self.context().get_state())
             self.assertEqual(await self.context().get_data(), {})
+
+    async def finish_af1_fixed_insoles(self, no_box=True):
+        await self.prepare_af1()
+        for _ in range(7):
+            await self.send(photo=True)
+        await self.send(FIXED_INSOLES)
+        await self.send(photo=True)  # Стельки сверху внутри обуви.
+        await self.send(photo=True)  # Подошва.
+        await self.send(photo=True)  # Вставка AF1.
+        await self.send(NO_BOX) if no_box else await self.send(photo=True)
+
+    async def test_fixed_insoles_skip_and_counts(self):
+        await self.prepare_af1()
+        for _ in range(7):
+            await self.send(photo=True)
+        self.assertIn(FIXED_INSOLES, str(self.answer.call_args.kwargs["reply_markup"]))
+        await self.send(FIXED_INSOLES)
+        data = await self.context().get_data()
+        self.assertTrue(data["insole_not_removable"])
+        self.assertEqual(data["photo_index"], 7)
+        self.assertNotIn("INSOLES_TOP", data["photos"])
+        for step in ("INSOLES_BOTTOM", "UNDER_INSOLE"):
+            self.assertEqual(data["photos"][step]["status"], "unavailable")
+            self.assertEqual(data["photos"][step]["reason"], "insole_not_removable")
+            self.assertIsNone(data["photos"][step]["file_id"])
+        await self.send(FIXED_INSOLES)  # Повторное нажатие не создаёт дубликатов.
+        await self.send(photo=True)
+        self.assertEqual((await self.context().get_data())["photo_index"], 10)
+        self.assertIn("Фото 11 из 13", self.answer.call_args.args[0])
+        await self.send(photo=True)
+        await self.send(photo=True)
+        await self.send(NO_BOX)
+        self.assertEqual(await self.context().get_state(), AF1.review.state)
+        text = self.answer.call_args.args[0]
+        for line in ("Получено: 10", "Недоступно: 3", "Пропущено: 0", "Требует пересъёмки: 0",
+                     "Обратная сторона стелек — недоступно (стельки не снимаются)",
+                     "Под стелькой — недоступно (стельки не снимаются)",
+                     "Наклейка коробки — недоступно (нет коробки)"):
+            self.assertIn(line, text)
+        await self.send(ANALYZE)
+        self.assertEqual(self.answer.call_args.args[0], PLACEHOLDER)
+
+    async def test_fixed_insoles_back_skips_unavailable(self):
+        await self.prepare_af1()
+        for _ in range(7):
+            await self.send(photo=True)
+        await self.send(FIXED_INSOLES)
+        await self.send(photo=True)
+        await self.send(BACK)
+        self.assertEqual((await self.context().get_data())["photo_index"], 7)
+        await self.send(photo=True)
+        self.assertEqual((await self.context().get_data())["photo_index"], 10)
+
+    async def test_fixed_insoles_reshoot_keeps_other_records(self):
+        await self.finish_af1_fixed_insoles()
+        before = (await self.context().get_data())["photos"]
+        await self.send(RETAKE)
+        await self.send("Стельки сверху")
+        await self.send(photo=True)
+        after = (await self.context().get_data())["photos"]
+        self.assertNotEqual(before["INSOLES_TOP"]["file_id"], after["INSOLES_TOP"]["file_id"])
+        for step in before:
+            if step != "INSOLES_TOP":
+                self.assertEqual(before[step], after[step])
+        await self.send(RETAKE)
+        await self.send("Обратная сторона стелек — недоступно")
+        self.assertEqual(await self.context().get_state(), AF1.retake.state)
+        self.assertIn("Не отклеивайте", self.answer.call_args_list[-2].args[0])
+        await self.send(BACK)
+        await self.send(RETAKE)
+        await self.send("Наклейка коробки — недоступно")
+        await self.send(photo=True)
+        self.assertIn("Получено: 11", self.answer.call_args.args[0])
+        self.assertIn("Недоступно: 2", self.answer.call_args.args[0])
+        box = (await self.context().get_data())["photos"]["BOX_LABEL"]
+        self.assertEqual(box["status"], "received")
+        self.assertIsNone(box["reason"])
+
+    async def test_fixed_insoles_choice_during_reshoot(self):
+        await self.finish_af1()
+        await self.send(RETAKE)
+        await self.send("Стельки сверху")
+        await self.send(FIXED_INSOLES)
+        await self.send(photo=True)
+        self.assertEqual(await self.context().get_state(), AF1.review.state)
+        self.assertIn("Получено: 11", self.answer.call_args.args[0])
+        self.assertIn("Недоступно: 2", self.answer.call_args.args[0])
+        data = await self.context().get_data()
+        for step in ("INSOLES_BOTTOM", "UNDER_INSOLE"):
+            self.assertEqual(data["photos"][step]["status"], "unavailable")
+            self.assertIsNone(data["photos"][step]["file_id"])
+        await self.send(CANCEL_BUTTON)
+        await self.prepare_af1()
+        self.assertNotIn("insole_not_removable", await self.context().get_data())
+
+    async def test_review_calculates_all_statuses(self):
+        await self.finish_af1_fixed_insoles()
+        photos = dict((await self.context().get_data())["photos"])
+        photos["TOP_VIEW"] = make_record(PHOTO_REQUIREMENTS[0], 1, status=PhotoStatus.MISSING)
+        photos["HEELS"] = make_record(PHOTO_REQUIREMENTS[3], 4,
+                                     status=PhotoStatus.NEEDS_RESHOOT, file_id="bad-photo", reason="wrong_zone")
+        await self.context().update_data(photos=photos)
+        await self.send("refresh")
+        text = self.answer.call_args.args[0]
+        for line in ("Получено: 8", "Недоступно: 3", "Пропущено: 1", "Требует пересъёмки: 1",
+                     "Вид сверху — пропущено", "Задники — требует пересъёмки"):
+            self.assertIn(line, text)
+        await self.send(ANALYZE)
+        self.assertNotEqual(self.answer.call_args.args[0], PLACEHOLDER)
+        await self.send(RETAKE)
+        await self.send("Задники — требует пересъёмки")
+        await self.send(photo=True)
+        self.assertIn("Получено: 9", self.answer.call_args.args[0])
+        self.assertIn("Требует пересъёмки: 0", self.answer.call_args.args[0])
+        await self.send(RETAKE)
+        await self.send("Вид сверху — пропущено")
+        await self.send(photo=True)
+        self.assertIn("Получено: 10", self.answer.call_args.args[0])
+
+    async def test_validation_precedes_received_and_handles_rejection(self):
+        await self.prepare_af1()
+        async def reject(requirement, photo):
+            self.assertEqual(requirement.id, "TOP_VIEW")
+            self.assertTrue(photo.file_id)
+            self.assertNotIn("TOP_VIEW", (await self.context().get_data())["photos"])
+            return PhotoValidationResult(False, PhotoStatus.NEEDS_RESHOOT,
+                                         "wrong_zone", "Переснимите вид сверху.")
+        with patch("legitbot.photo_validation.validate_photo", new_callable=AsyncMock) as validator:
+            validator.side_effect = reject
+            await self.send(photo=True)
+            validator.assert_awaited_once()
+        data = await self.context().get_data()
+        self.assertEqual(data["photos"]["TOP_VIEW"]["status"], "needs_reshoot")
+        self.assertEqual(data["photos"]["TOP_VIEW"]["reason"], "wrong_zone")
+        self.assertEqual(data["photo_index"], 0)
+        self.assertEqual(await self.context().get_state(), AF1.photos.state)
+        self.assertEqual(self.answer.call_args_list[-2].args[0], "Переснимите вид сверху.")
+        await self.send(photo=True)
+        record = (await self.context().get_data())["photos"]["TOP_VIEW"]
+        self.assertEqual(record["status"], "received")
+        self.assertIsNone(record["reason"])
+
+    async def test_validation_called_on_reshoot_but_not_nonphotos(self):
+        from legitbot.photo_validation import validate_photo
+        await self.finish_af1()
+        await self.send(RETAKE)
+        await self.send("Вид сверху")
+        with patch("legitbot.photo_validation.validate_photo", wraps=validate_photo) as validator:
+            await self.send("not a photo")
+            await self.send(photo=True, media_group_id="album")
+            validator.assert_not_called()
+            await self.send(photo=True)
+            validator.assert_awaited_once()
+        self.assertEqual(await self.context().get_state(), AF1.review.state)
+
+    async def test_fixed_insoles_button_only_at_top(self):
+        await self.prepare_af1()
+        await self.send(FIXED_INSOLES)
+        data = await self.context().get_data()
+        self.assertNotIn("insole_not_removable", data)
+        self.assertEqual(data["photo_index"], 0)
+        await self.finish_af1()
+        self.assertIn("Получено: 13", self.answer.call_args.args[0])
+        self.assertIn("Недоступно: 0", self.answer.call_args.args[0])
 
 if __name__ == "__main__":
     unittest.main()

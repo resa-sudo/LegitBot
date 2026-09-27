@@ -1,14 +1,20 @@
 """Сбор и пересъёмка AF1: один обработчик для всех настроенных зон."""
-from aiogram import F, Router
+from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
 from .flow import keyboard, Check, BEGIN_BUTTON, show_lines
-from .photo_requirements import MODEL, FULL_MODEL, PHOTO_REQUIREMENTS
+from .photo_requirements import (
+    MODEL, FULL_MODEL, AF1_PHOTO_REQUIREMENTS as PHOTO_REQUIREMENTS,
+    AF1_INSOLE_REMOVAL_ZONES,
+)
+from .photo_records import PhotoStatus, make_record, summary_counts
+from . import photo_validation
 
 BACK = "Назад"
 NO_BOX = "У меня нет коробки"
+FIXED_INSOLES = "Стельки не снимаются"
 ANALYZE = "Начать анализ"
 RETAKE = "Переснять фото"
 OTHER_MODEL = "Другая Air Force 1"
@@ -16,6 +22,16 @@ UNSUPPORTED = ("Эта модель пока находится в разраб�
                "Сейчас полноценная проверка доступна для Nike Air Force 1.")
 PLACEHOLDER = ("Все материалы подготовлены для анализа.\n\n"
                "Автоматическая проверка будет подключена на следующем этапе разработки.")
+REASONS = {
+    "insole_not_removable": "стельки не снимаются",
+    "no_box": "нет коробки",
+}
+STATUS_LABELS = {
+    "received": "получено",
+    "unavailable": "недоступно",
+    "missing": "пропущено",
+    "needs_reshoot": "требует пересъёмки",
+}
 
 
 class AF1(StatesGroup):
@@ -50,7 +66,6 @@ async def select_model(message: Message, state: FSMContext) -> None:
 
 async def begin(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    # Повторный вход с первого шага сохраняет уже загруженные ракурсы.
     if not isinstance(data.get("photos"), dict):
         await state.update_data(photos={})
     await state.update_data(photo_index=0, retaking=False)
@@ -61,8 +76,10 @@ async def begin(message: Message, state: FSMContext) -> None:
 async def prompt(message: Message, index: int) -> None:
     requirement = PHOTO_REQUIREMENTS[index]
     buttons = [BACK]
-    if not requirement.required:
+    if requirement.id == "BOX_LABEL":
         buttons.insert(0, NO_BOX)
+    if requirement.id == "INSOLES_TOP":
+        buttons.insert(0, FIXED_INSOLES)
     await message.answer(
         f"Фото {index + 1} из {len(PHOTO_REQUIREMENTS)}\n\n"
         f"Фото {index + 1}/13 — {requirement.title[0].lower() + requirement.title[1:]}\n\n{requirement.instruction}\n\n"
@@ -70,72 +87,137 @@ async def prompt(message: Message, index: int) -> None:
         reply_markup=keyboard(*buttons, cancel=True))
 
 
+def applicable(index: int, data: dict) -> bool:
+    return not (data.get("insole_not_removable") and
+                PHOTO_REQUIREMENTS[index].id in AF1_INSOLE_REMOVAL_ZONES)
+
+
 def complete(photos: dict) -> bool:
-    return all(
-        photos.get(r.id, {}).get("file_id") or
-        (not r.required and photos.get(r.id, {}).get("missing") is True)
-        for r in PHOTO_REQUIREMENTS
-    )
+    """Завершение сбора, а не полнота доказательств или подлинность."""
+    for requirement in PHOTO_REQUIREMENTS:
+        record = photos.get(requirement.id, {})
+        if record.get("status") == PhotoStatus.RECEIVED and record.get("file_id"):
+            continue
+        if record.get("status") == PhotoStatus.UNAVAILABLE:
+            if requirement.id == "BOX_LABEL" and record.get("reason") == "no_box":
+                continue
+            if requirement.id in AF1_INSOLE_REMOVAL_ZONES and record.get("reason") == "insole_not_removable":
+                continue
+        return False
+    return True
 
 
 async def review(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     photos = data.get("photos", {})
-    if not complete(photos):
-        index = next(i for i, r in enumerate(PHOTO_REQUIREMENTS)
-                     if not photos.get(r.id, {}).get("file_id")
-                     and not (not r.required and photos.get(r.id, {}).get("missing")))
-        await state.update_data(photo_index=index, retaking=False)
-        await state.set_state(AF1.photos)
-        await prompt(message, index)
-        return
     await state.update_data(retaking=False)
     await state.set_state(AF1.review)
-    count = sum(bool(p.get("file_id")) for p in photos.values())
-    missing = "\n\nНаклейка коробки — отсутствует" if photos["BOX_LABEL"]["missing"] else ""
+    counts = summary_counts(PHOTO_REQUIREMENTS, photos)
+    problems = []
+    for requirement in PHOTO_REQUIREMENTS:
+        record = photos.get(requirement.id, {})
+        status = record.get("status", "missing")
+        if status != PhotoStatus.RECEIVED or not record.get("file_id"):
+            label = STATUS_LABELS.get(status, "пропущено")
+            if status == PhotoStatus.RECEIVED:
+                label = "пропущено"
+            reason = REASONS.get(record.get("reason"))
+            problems.append(f"• {requirement.title} — {label}" + (f" ({reason})" if reason else ""))
+    details = "\n\n" + "\n".join(problems) if problems else ""
     await message.answer(
-        f"Фотографии получены 👟\n\nМодель:\n{FULL_MODEL}\n\n"
-        f"Получено фотографий: {count}/13\n\n"
-        "Перед анализом проверьте, что фотографии чёткие и все детали хорошо видны."
-        + missing, reply_markup=keyboard(ANALYZE, RETAKE, cancel=True))
+        f"Фотографии собраны 👟\n\nМодель:\n{FULL_MODEL}\n\n"
+        f"Получено: {counts['received']}\n"
+        f"Недоступно: {counts['unavailable']}\n"
+        f"Пропущено: {counts['missing']}\n"
+        f"Требует пересъёмки: {counts['needs_reshoot']}"
+        + details + "\n\nПеред анализом проверьте, что фотографии чёткие и все детали хорошо видны.",
+        reply_markup=keyboard(ANALYZE, RETAKE, cancel=True))
 
 
-async def save_photo(message: Message, state: FSMContext, missing: bool = False) -> None:
+async def advance(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("retaking"):
+        index = next((i for i in range(data["photo_index"] + 1, len(PHOTO_REQUIREMENTS))
+                      if applicable(i, data)), None)
+        if index is not None:
+            await state.update_data(photo_index=index)
+            await prompt(message, index)
+            return
+    await review(message, state)
+
+
+async def save_photo(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     index = data["photo_index"]
     requirement = PHOTO_REQUIREMENTS[index]
+    # До ответа валидатора файл не получает статус received.
+    result = await photo_validation.validate_photo(requirement, message.photo[-1])
+    if result.accepted != (result.status == PhotoStatus.RECEIVED):
+        raise ValueError("Inconsistent photo validation result")
     photos = dict(data.get("photos", {}))
-    photos[requirement.id] = {
-        "step_id": requirement.id,
-        "file_id": None if missing else message.photo[-1].file_id,
-        "analysis_zone": requirement.analysis_zone,
-        "step_number": index + 1,
-        "missing": missing,
-    }
+    photos[requirement.id] = make_record(
+        requirement, index + 1, file_id=message.photo[-1].file_id,
+        status=result.status, reason=result.reason)
     await state.update_data(photos=photos)
-    if data.get("retaking") or index == len(PHOTO_REQUIREMENTS) - 1:
-        await review(message, state)
-    else:
-        await state.update_data(photo_index=index + 1)
-        await prompt(message, index + 1)
+    if result.user_message:
+        await message.answer(result.user_message)
+    if not result.accepted:
+        if not result.user_message:
+            await message.answer("Пожалуйста, переснимите эту зону.")
+        await prompt(message, index)
+        return
+    await advance(message, state)
+
+
+async def mark_no_box(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    index = data["photo_index"]
+    photos = dict(data.get("photos", {}))
+    photos["BOX_LABEL"] = make_record(
+        PHOTO_REQUIREMENTS[index], index + 1,
+        status=PhotoStatus.UNAVAILABLE, reason="no_box")
+    await state.update_data(photos=photos)
+    await advance(message, state)
+
+
+async def mark_fixed_insoles(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    photos = dict(data.get("photos", {}))
+    for index, requirement in enumerate(PHOTO_REQUIREMENTS):
+        if requirement.id in AF1_INSOLE_REMOVAL_ZONES:
+            photos[requirement.id] = make_record(
+                requirement, index + 1, status=PhotoStatus.UNAVAILABLE,
+                reason="insole_not_removable")
+    await state.update_data(photos=photos, insole_not_removable=True)
+    await message.answer(
+        "Не отклеивайте и не вытягивайте стельки силой. "
+        "Сфотографируйте их сверху внутри обуви. "
+        "Обратную сторону и пространство под стелькой отметим как недоступные.")
+    # Верх стельки остаётся обязательным, два следующих ракурса будут пропущены.
+    await prompt(message, data["photo_index"])
 
 
 async def photo_input(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     index = data["photo_index"]
+    requirement = PHOTO_REQUIREMENTS[index]
     if message.text == BACK:
         if data.get("retaking"):
             await retake_menu(message, state)
-        elif index == 0:
-            await state.set_state(Check.confirmation)
-            await message.answer(
-                f"Модель: {FULL_MODEL}",
-                reply_markup=keyboard(BEGIN_BUTTON, BACK, cancel=True))
         else:
-            await state.update_data(photo_index=index - 1)
-            await prompt(message, index - 1)
-    elif message.text == NO_BOX and not PHOTO_REQUIREMENTS[index].required:
-        await save_photo(message, state, missing=True)
+            previous = next((i for i in range(index - 1, -1, -1) if applicable(i, data)), None)
+            if previous is None:
+                await state.set_state(Check.confirmation)
+                await message.answer(
+                    f"Модель: {FULL_MODEL}",
+                    reply_markup=keyboard(BEGIN_BUTTON, BACK, cancel=True))
+            else:
+                await state.update_data(photo_index=previous)
+                await prompt(message, previous)
+    elif message.text == FIXED_INSOLES and requirement.id == "INSOLES_TOP":
+        await mark_fixed_insoles(message, state)
+    elif message.text == NO_BOX and requirement.id == "BOX_LABEL":
+        await mark_no_box(message, state)
     elif message.photo and not message.media_group_id:
         await save_photo(message, state)
     else:
@@ -144,7 +226,8 @@ async def photo_input(message: Message, state: FSMContext) -> None:
 
 
 def zone_label(requirement, photos: dict) -> str:
-    suffix = " — отсутствует" if photos.get(requirement.id, {}).get("missing") else ""
+    status = photos.get(requirement.id, {}).get("status", "missing")
+    suffix = "" if status == PhotoStatus.RECEIVED else " — " + STATUS_LABELS.get(status, "пропущено")
     return requirement.title + suffix
 
 
@@ -154,7 +237,7 @@ async def retake_menu(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Выберите фото, которое хотите переснять:",
         reply_markup=keyboard(
-            *(zone_label(r, data["photos"]) for r in PHOTO_REQUIREMENTS),
+            *(zone_label(r, data.get("photos", {})) for r in PHOTO_REQUIREMENTS),
             BACK, cancel=True))
 
 
@@ -164,7 +247,13 @@ async def select_retake(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     for index, requirement in enumerate(PHOTO_REQUIREMENTS):
-        if message.text == zone_label(requirement, data["photos"]):
+        if message.text == zone_label(requirement, data.get("photos", {})):
+            if not applicable(index, data):
+                await message.answer(
+                    "Эта зона недоступна: стельки не снимаются. "
+                    "Не отклеивайте их и не применяйте силу.")
+                await retake_menu(message, state)
+                return
             await state.update_data(photo_index=index, retaking=True)
             await state.set_state(AF1.photos)
             await prompt(message, index)
@@ -180,6 +269,7 @@ async def review_input(message: Message, state: FSMContext) -> None:
         if complete(data.get("photos", {})):
             await message.answer(PLACEHOLDER)
         else:
+            await message.answer("Есть пропущенные фото или снимки, требующие пересъёмки. Выберите «Переснять фото».")
             await review(message, state)
     else:
         await review(message, state)
